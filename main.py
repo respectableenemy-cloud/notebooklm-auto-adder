@@ -12,6 +12,7 @@ import asyncio
 import os
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.responses import HTMLResponse
@@ -31,11 +32,23 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 
+# ---- 起動時に認証ファイルを書き出す --------------------------
+def setup_auth():
+    auth_json = os.environ.get("NOTEBOOKLM_AUTH_JSON")
+    if not auth_json:
+        return
+    storage_path = Path.home() / ".notebooklm" / "storage_state.json"
+    storage_path.parent.mkdir(parents=True, exist_ok=True)
+    storage_path.write_text(auth_json, encoding="utf-8")
+
+
+setup_auth()
+
+
 # ---- NotebookLM クライアント初期化 --------------------------
 @asynccontextmanager
 async def get_notebooklm():
-    auth_json = os.environ.get("NOTEBOOKLM_AUTH_JSON")
-    if not auth_json:
+    if not os.environ.get("NOTEBOOKLM_AUTH_JSON"):
         raise RuntimeError("NOTEBOOKLM_AUTH_JSON が設定されていません")
     async with await NotebookLMClient.from_storage() as client:
         yield client
