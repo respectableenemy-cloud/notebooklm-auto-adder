@@ -1,0 +1,4 @@
+fastapi
+uvicorn[standard]
+notebooklm-py[browser]
+ddgs
