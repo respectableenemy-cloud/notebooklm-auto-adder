@@ -223,8 +223,14 @@ HTML_UI = """<!DOCTYPE html>
         });
 
         if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.detail || res.statusText);
+          let errMsg = `HTTP ${res.status}: ${res.statusText}`;
+          try {
+            const err = await res.json();
+            errMsg = err.detail || errMsg;
+          } catch {
+            try { errMsg = await res.text(); } catch {}
+          }
+          throw new Error(errMsg);
         }
 
         const data = await res.json();
