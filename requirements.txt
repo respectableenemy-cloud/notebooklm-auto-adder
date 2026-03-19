@@ -1,4 +1,5 @@
 fastapi
 uvicorn[standard]
-notebooklm-py[browser]
+notebooklm-py
+playwright
 ddgs
