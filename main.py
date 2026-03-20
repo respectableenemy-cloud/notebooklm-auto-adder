@@ -131,9 +131,18 @@ async def login_page():
     return LOGIN_PAGE
 
 
+def get_redirect_uri(request: Request) -> str:
+    # Railway のリバースプロキシ経由では request.base_url が http:// になるため、
+    # RAILWAY_PUBLIC_DOMAIN が設定されていれば https:// で明示的に組み立てる。
+    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+    if domain:
+        return f"https://{domain}/auth/callback"
+    return str(request.base_url) + "auth/callback"
+
+
 @app.get("/auth/start")
 async def auth_start(request: Request):
-    redirect_uri = str(request.base_url) + "auth/callback"
+    redirect_uri = get_redirect_uri(request)
     params = {
         "client_id": GOOGLE_CLIENT_ID,
         "redirect_uri": redirect_uri,
@@ -151,7 +160,7 @@ async def auth_callback(request: Request, code: str = None, error: str = None):
     if error or not code:
         return HTMLResponse(f"<p>ログインエラー: {error}</p>", status_code=400)
 
-    redirect_uri = str(request.base_url) + "auth/callback"
+    redirect_uri = get_redirect_uri(request)
 
     async with httpx.AsyncClient() as client:
         token_resp = await client.post(GOOGLE_TOKEN_URL, data={
