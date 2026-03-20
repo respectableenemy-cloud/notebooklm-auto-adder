@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-03-21
+
+### Fixed: Google OAuth リダイレクト URI の http/https 不一致
+
+#### 問題
+Railway のリバースプロキシ内部では通信が `http://` になるため、`request.base_url` が `http://web-production-53229.up.railway.app/` を返していた。Google に送るリダイレクト URI が `http://` になり、Cloud Console に登録した `https://` と不一致になって「アクセスをブロック」エラーが発生していた。
+
+#### 変更内容
+
+**`main.py`**
+- `get_redirect_uri()` ヘルパーを追加
+  - `RAILWAY_PUBLIC_DOMAIN` 環境変数（Railway が自動設定）が存在する場合は `https://{domain}/auth/callback` を返す
+  - ローカル等では従来通り `request.base_url` を使用
+- `/auth/start` と `/auth/callback` の両方で `get_redirect_uri()` を使用するよう変更
+
+---
+
 ## 2026-03-20（2回目）
 
 ### Added: Google OAuth ログイン
