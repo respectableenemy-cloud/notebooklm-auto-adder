@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-03-20（2回目）
+
+### Added: Google OAuth ログイン
+
+#### 変更内容
+
+**`main.py`**
+- Google OAuth フロー実装（`/login` → `/auth/start` → Google → `/auth/callback`）
+- セッションを `itsdangerous` で署名した HTTP-only Cookie で管理（7日間有効）
+- `ALLOWED_EMAILS` 環境変数で許可メールアドレスを制限
+- ログアウト（`/logout`）追加
+- `APP_SECRET` / `HTTPBearer` 認証を削除
+- UI からパスワード入力欄を削除、右上にログイン中メールアドレスとログアウトリンクを追加
+
+**`requirements.txt`**
+- `httpx`（OAuth トークン交換）、`itsdangerous`（セッション署名）を追加
+
+#### Railway に追加で必要な環境変数
+| 変数名 | 内容 |
+|---|---|
+| `GOOGLE_CLIENT_ID` | Google Cloud Console で取得 |
+| `GOOGLE_CLIENT_SECRET` | 同上 |
+| `ALLOWED_EMAILS` | 許可するメール（カンマ区切り） |
+| `SESSION_SECRET` | 任意の長い文字列（セッション署名用） |
+
+---
+
 ## 2026-03-20
 
 ### Fixed: HTTP 500 エラーの原因特定と修正

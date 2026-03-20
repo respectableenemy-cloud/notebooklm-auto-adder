@@ -5,18 +5,19 @@ Railway にデプロイして iPhone のブラウザから使う。
 
 環境変数（Railway に設定）:
   NOTEBOOKLM_AUTH_JSON  : Mac の ~/.notebooklm/storage_state.json の中身
-  APP_SECRET            : アクセス用パスワード（任意の文字列）
+  GOOGLE_CLIENT_ID      : Google OAuth クライアント ID
+  GOOGLE_CLIENT_SECRET  : Google OAuth クライアントシークレット
+  ALLOWED_EMAILS        : 許可するメールアドレス（カンマ区切り）例: a@gmail.com,b@gmail.com
+  SESSION_SECRET        : セッション署名用の秘密鍵（任意の長い文字列）
 """
 
 import asyncio
 import os
-import json
+import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 # ---- Playwright サンドボックス無効化（Railway/Docker コンテナ対応） ----
-# コンテナ環境では Chromium の sandbox に必要な Linux Capability がないため、
-# notebooklm-py がブラウザを起動する前にモンキーパッチで --no-sandbox を注入する。
 import playwright.async_api as _pw
 
 _orig_launch = _pw.BrowserType.launch  # type: ignore[attr-defined]
@@ -31,25 +32,45 @@ async def _sandboxless_launch(self, **kwargs):
 _pw.BrowserType.launch = _sandboxless_launch  # type: ignore[method-assign]
 # -----------------------------------------------------------------------
 
-from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.responses import HTMLResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import httpx
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from fastapi import FastAPI, HTTPException, Depends, status, Cookie, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from ddgs import DDGS
 from notebooklm import NotebookLMClient
 
-APP_SECRET = os.environ.get("APP_SECRET", "")
+# ---- OAuth 設定 -------------------------------------------------------
+GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+ALLOWED_EMAILS       = [e.strip() for e in os.environ.get("ALLOWED_EMAILS", "").split(",") if e.strip()]
+SESSION_SECRET       = os.environ.get("SESSION_SECRET", "fallback-change-me")
+
+GOOGLE_AUTH_URL  = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_INFO_URL  = "https://www.googleapis.com/oauth2/v3/userinfo"
+
+signer = URLSafeTimedSerializer(SESSION_SECRET)
 
 
-# ---- 認証 ---------------------------------------------------
-security = HTTPBearer()
+# ---- セッション検証 ---------------------------------------------------
+def require_login(session: str = Cookie(default=None)):
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+            headers={"Location": "/login"},
+        )
+    try:
+        email = signer.loads(session, max_age=86400 * 7)  # 7日間有効
+        return email
+    except (BadSignature, SignatureExpired):
+        raise HTTPException(
+            status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+            headers={"Location": "/login"},
+        )
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if APP_SECRET and credentials.credentials != APP_SECRET:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-
-# ---- 起動時に認証ファイルを書き出す --------------------------
+# ---- 起動時に認証ファイルを書き出す -----------------------------------
 def setup_auth():
     auth_json = os.environ.get("NOTEBOOKLM_AUTH_JSON")
     if not auth_json:
@@ -62,7 +83,7 @@ def setup_auth():
 setup_auth()
 
 
-# ---- NotebookLM クライアント初期化 --------------------------
+# ---- NotebookLM クライアント -----------------------------------------
 @asynccontextmanager
 async def get_notebooklm():
     if not os.environ.get("NOTEBOOKLM_AUTH_JSON"):
@@ -71,15 +92,15 @@ async def get_notebooklm():
         yield client
 
 
-# ---- アプリ -------------------------------------------------
+# ---- アプリ ----------------------------------------------------------
 app = FastAPI(title="NotebookLM Auto Adder")
 
 
-# ---- リクエスト / レスポンス モデル -------------------------
+# ---- リクエスト / レスポンス モデル ----------------------------------
 class RunRequest(BaseModel):
     keyword: str
     num_results: int = 20
-    notebook_name: str = ""   # 空なら keyword をそのまま使う
+    notebook_name: str = ""
     region: str = "jp-jp"
 
 
@@ -99,29 +120,98 @@ class RunResponse(BaseModel):
     fail_count: int
 
 
-# ---- エンドポイント -----------------------------------------
+# ---- エンドポイント --------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTML_UI
+async def index(email: str = Depends(require_login)):
+    return HTML_UI.replace("__USER_EMAIL__", email)
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    return LOGIN_PAGE
+
+
+@app.get("/auth/start")
+async def auth_start(request: Request):
+    redirect_uri = str(request.base_url) + "auth/callback"
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "offline",
+        "prompt": "select_account",
+    }
+    url = GOOGLE_AUTH_URL + "?" + urllib.parse.urlencode(params)
+    return RedirectResponse(url)
+
+
+@app.get("/auth/callback")
+async def auth_callback(request: Request, code: str = None, error: str = None):
+    if error or not code:
+        return HTMLResponse(f"<p>ログインエラー: {error}</p>", status_code=400)
+
+    redirect_uri = str(request.base_url) + "auth/callback"
+
+    async with httpx.AsyncClient() as client:
+        token_resp = await client.post(GOOGLE_TOKEN_URL, data={
+            "code": code,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+        })
+        token_data = token_resp.json()
+
+        if "error" in token_data:
+            return HTMLResponse(f"<p>トークン取得エラー: {token_data['error']}</p>", status_code=400)
+
+        info_resp = await client.get(
+            GOOGLE_INFO_URL,
+            headers={"Authorization": f"Bearer {token_data['access_token']}"},
+        )
+        userinfo = info_resp.json()
+
+    email = userinfo.get("email", "")
+    if ALLOWED_EMAILS and email not in ALLOWED_EMAILS:
+        return HTMLResponse(
+            f"<p style='font-family:sans-serif;padding:40px'>アクセス権限がありません（{email}）</p>",
+            status_code=403,
+        )
+
+    session_token = signer.dumps(email)
+    response = RedirectResponse("/", status_code=302)
+    response.set_cookie(
+        "session", session_token,
+        httponly=True, secure=True, samesite="lax", max_age=86400 * 7,
+    )
+    return response
+
+
+@app.get("/logout")
+async def logout():
+    response = RedirectResponse("/login", status_code=302)
+    response.delete_cookie("session")
+    return response
 
 
 @app.get("/health")
 async def health():
     auth_ok = bool(os.environ.get("NOTEBOOKLM_AUTH_JSON"))
-    secret_ok = bool(os.environ.get("APP_SECRET"))
     return {
         "status": "ok" if auth_ok else "error",
         "NOTEBOOKLM_AUTH_JSON": "set" if auth_ok else "missing",
-        "APP_SECRET": "set" if secret_ok else "missing (optional)",
+        "GOOGLE_CLIENT_ID": "set" if GOOGLE_CLIENT_ID else "missing",
+        "ALLOWED_EMAILS": ALLOWED_EMAILS,
     }
 
 
 @app.post("/run", response_model=RunResponse)
-async def run(req: RunRequest, _=Depends(verify_token)):
+async def run(req: RunRequest, email: str = Depends(require_login)):
     if not os.environ.get("NOTEBOOKLM_AUTH_JSON"):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="NOTEBOOKLM_AUTH_JSON が Railway の環境変数に設定されていません",
+            detail="NOTEBOOKLM_AUTH_JSON が設定されていません",
         )
 
     notebook_name = req.notebook_name.strip() or req.keyword
@@ -170,7 +260,48 @@ async def run(req: RunRequest, _=Depends(verify_token)):
     )
 
 
-# ---- モバイル UI（HTML） ------------------------------------
+# ---- ログインページ --------------------------------------------------
+LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NotebookLM Auto Adder - ログイン</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, sans-serif; background: #f5f5f7; color: #1d1d1f;
+           display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
+    .card { background: #fff; border-radius: 20px; padding: 40px 32px; width: 100%; max-width: 360px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08); text-align: center; }
+    h1 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+    p { color: #6e6e73; font-size: 14px; margin-bottom: 32px; }
+    .google-btn { display: flex; align-items: center; justify-content: center; gap: 12px;
+                  width: 100%; padding: 16px; background: #fff; border: 1.5px solid #d2d2d7;
+                  border-radius: 12px; font-size: 16px; font-weight: 600; cursor: pointer;
+                  text-decoration: none; color: #1d1d1f; transition: background 0.15s; }
+    .google-btn:hover { background: #f5f5f7; }
+    .google-icon { width: 20px; height: 20px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>📚 NotebookLM<br>Auto Adder</h1>
+    <p>続けるには Google アカウントでログインしてください</p>
+    <a href="/auth/start" class="google-btn">
+      <svg class="google-icon" viewBox="0 0 24 24">
+        <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+        <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+        <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+        <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+      </svg>
+      Google でログイン
+    </a>
+  </div>
+</body>
+</html>"""
+
+
+# ---- メイン UI -------------------------------------------------------
 HTML_UI = """<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -180,7 +311,11 @@ HTML_UI = """<!DOCTYPE html>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, sans-serif; background: #f5f5f7; color: #1d1d1f; padding: 20px; }
-    h1 { font-size: 22px; font-weight: 700; margin-bottom: 24px; }
+    .header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; }
+    h1 { font-size: 22px; font-weight: 700; }
+    .user-info { text-align: right; }
+    .user-email { font-size: 11px; color: #6e6e73; margin-bottom: 4px; }
+    .logout { font-size: 12px; color: #ff3b30; text-decoration: none; }
     label { display: block; font-size: 13px; font-weight: 600; color: #6e6e73; margin-bottom: 6px; }
     input, select { width: 100%; padding: 14px; border: 1px solid #d2d2d7; border-radius: 12px;
                     font-size: 16px; background: #fff; margin-bottom: 16px; appearance: none; }
@@ -206,7 +341,13 @@ HTML_UI = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h1>📚 NotebookLM<br>Auto Adder</h1>
+  <div class="header">
+    <h1>📚 NotebookLM<br>Auto Adder</h1>
+    <div class="user-info">
+      <div class="user-email">__USER_EMAIL__</div>
+      <a href="/logout" class="logout">ログアウト</a>
+    </div>
+  </div>
 
   <label>検索キーワード</label>
   <input id="keyword" type="text" placeholder="例: Claude Code Skills" />
@@ -227,9 +368,6 @@ HTML_UI = """<!DOCTYPE html>
     <option value="us-en">英語（us-en）</option>
   </select>
 
-  <label>アクセストークン</label>
-  <input id="token" type="password" placeholder="APP_SECRET の値" />
-
   <button id="btn" onclick="run()">検索して追加する</button>
 
   <div id="result"></div>
@@ -238,7 +376,6 @@ HTML_UI = """<!DOCTYPE html>
     async function run() {
       const keyword = document.getElementById('keyword').value.trim();
       if (!keyword) { alert('キーワードを入力してください'); return; }
-      const token = document.getElementById('token').value.trim();
       const btn = document.getElementById('btn');
       const result = document.getElementById('result');
 
@@ -250,10 +387,7 @@ HTML_UI = """<!DOCTYPE html>
       try {
         const res = await fetch('/run', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + token,
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             keyword,
             notebook_name: document.getElementById('name').value.trim(),
@@ -263,6 +397,7 @@ HTML_UI = """<!DOCTYPE html>
         });
 
         if (!res.ok) {
+          if (res.status === 307) { location.href = '/login'; return; }
           let errMsg = `HTTP ${res.status}: ${res.statusText}`;
           try {
             const err = await res.json();
