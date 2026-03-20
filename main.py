@@ -14,6 +14,23 @@ import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+# ---- Playwright サンドボックス無効化（Railway/Docker コンテナ対応） ----
+# コンテナ環境では Chromium の sandbox に必要な Linux Capability がないため、
+# notebooklm-py がブラウザを起動する前にモンキーパッチで --no-sandbox を注入する。
+import playwright.async_api as _pw
+
+_orig_launch = _pw.BrowserType.launch  # type: ignore[attr-defined]
+
+async def _sandboxless_launch(self, **kwargs):
+    args = list(kwargs.pop("args", []))
+    for flag in ("--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"):
+        if flag not in args:
+            args.append(flag)
+    return await _orig_launch(self, args=args, **kwargs)
+
+_pw.BrowserType.launch = _sandboxless_launch  # type: ignore[method-assign]
+# -----------------------------------------------------------------------
+
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -88,36 +105,59 @@ async def index():
     return HTML_UI
 
 
+@app.get("/health")
+async def health():
+    auth_ok = bool(os.environ.get("NOTEBOOKLM_AUTH_JSON"))
+    secret_ok = bool(os.environ.get("APP_SECRET"))
+    return {
+        "status": "ok" if auth_ok else "error",
+        "NOTEBOOKLM_AUTH_JSON": "set" if auth_ok else "missing",
+        "APP_SECRET": "set" if secret_ok else "missing (optional)",
+    }
+
+
 @app.post("/run", response_model=RunResponse)
 async def run(req: RunRequest, _=Depends(verify_token)):
+    if not os.environ.get("NOTEBOOKLM_AUTH_JSON"):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="NOTEBOOKLM_AUTH_JSON が Railway の環境変数に設定されていません",
+        )
+
     notebook_name = req.notebook_name.strip() or req.keyword
 
     # 1. DuckDuckGo 検索
     raw_sources: list[tuple[str, str]] = []
-    with DDGS() as ddgs:
-        for r in ddgs.text(req.keyword, region=req.region, max_results=req.num_results):
-            url = r.get("href", "")
-            title = r.get("title", url)
-            if url:
-                raw_sources.append((title, url))
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.text(req.keyword, region=req.region, max_results=req.num_results):
+                url = r.get("href", "")
+                title = r.get("title", url)
+                if url:
+                    raw_sources.append((title, url))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"DuckDuckGo 検索エラー: {e}")
 
     if not raw_sources:
         raise HTTPException(status_code=404, detail="検索結果が見つかりませんでした")
 
     # 2. NotebookLM にノートブック作成 & ソース追加
     results: list[SourceResult] = []
-    async with get_notebooklm() as client:
-        notebook = await client.notebooks.create(notebook_name)
+    try:
+        async with get_notebooklm() as client:
+            notebook = await client.notebooks.create(notebook_name)
 
-        async def add_one(title: str, url: str) -> SourceResult:
-            try:
-                await client.sources.add_url(notebook.id, url, wait=True)
-                return SourceResult(title=title, url=url, ok=True)
-            except Exception as e:
-                return SourceResult(title=title, url=url, ok=False, error=str(e))
+            async def add_one(title: str, url: str) -> SourceResult:
+                try:
+                    await client.sources.add_url(notebook.id, url, wait=True)
+                    return SourceResult(title=title, url=url, ok=True)
+                except Exception as e:
+                    return SourceResult(title=title, url=url, ok=False, error=str(e))
 
-        tasks = [add_one(t, u) for t, u in raw_sources]
-        results = await asyncio.gather(*tasks)
+            tasks = [add_one(t, u) for t, u in raw_sources]
+            results = await asyncio.gather(*tasks)
+    except RuntimeError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
     ok_count = sum(1 for r in results if r.ok)
     return RunResponse(

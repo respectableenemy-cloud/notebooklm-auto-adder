@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+# コンテナログをバッファリングせず即時出力
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
 # Playwright の依存ライブラリをインストール
