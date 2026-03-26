@@ -92,8 +92,28 @@ async def get_notebooklm():
         yield client
 
 
+# ---- セッションキープアライブ ----------------------------------------
+async def _keepalive_loop():
+    """Googleセッションを維持するため48時間ごとにNotebookLMへアクセスする"""
+    while True:
+        await asyncio.sleep(60 * 60 * 48)
+        if not os.environ.get("NOTEBOOKLM_AUTH_JSON"):
+            continue
+        try:
+            async with get_notebooklm() as client:
+                await client.notebooks.list()
+        except Exception:
+            pass
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(_keepalive_loop())
+    yield
+
+
 # ---- アプリ ----------------------------------------------------------
-app = FastAPI(title="NotebookLM Auto Adder")
+app = FastAPI(title="NotebookLM Auto Adder", lifespan=lifespan)
 
 
 # ---- リクエスト / レスポンス モデル ----------------------------------

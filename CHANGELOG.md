@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-03-26
+
+### Added: セッションキープアライブ & 認証リフレッシュスクリプト
+
+#### 変更内容
+
+**`main.py`**
+- `_keepalive_loop()` を追加: 48時間ごとに `client.notebooks.list()` を呼び出してGoogleセッションを維持する
+- FastAPI `lifespan` を導入し、アプリ起動時にキープアライブタスクをバックグラウンドで起動
+
+**`../refresh_railway_auth.sh`**（ローカルスクリプト）
+- セッション失効時の復旧を1コマンド化
+- `notebooklm login` → `NOTEBOOKLM_AUTH_JSON` をRailwayへ自動反映 → リデプロイ まで自動実行
+
+---
+
+## 2026-03-21（2回目）
+
+### Changed: ファイル構成の整理
+
+#### 変更内容
+
+- `~/AI/` 直下に散在していた NotebookLM 関連ファイルを `~/AI/notebooklm/` フォルダに集約
+  - 移動したファイル: `add_to_notebooklm.py`、`export_auth_for_railway.py`、`railway_app/`
+  - `venv/` は移動すると壊れるため `~/AI/` 直下に残置
+- 各スクリプトはハードコードされたパスを持たないため、移動による動作への影響なし
+
+---
+
 ## 2026-03-21
 
 ### Fixed: Google OAuth リダイレクト URI の http/https 不一致
